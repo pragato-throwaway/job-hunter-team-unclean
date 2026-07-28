@@ -1,0 +1,55 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  eslint-web:
+    name: ESLint — web/
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+  prettier:
+    name: Prettier check — web/ + shared/
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install Prettier
+        # Versione FISSA: senza pin `npm install prettier` prende l'ultima e una
+        # nuova release riformatta file non toccati → Lint rosso su PR estranee.
+        # Allineata alla 3.8.3 contro cui il repo è già formattato.
+        run: npm install --no-save prettier@3.8.3
+
+      - name: Prettier check — web/
+        run: npx prettier --check "web/app/**/*.{ts,tsx}"
+
+      - name: Prettier check — shared/
+        run: npx prettier --check "shared/**/*.ts" --ignore-path /dev/null

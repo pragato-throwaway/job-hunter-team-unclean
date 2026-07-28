@@ -1,0 +1,265 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+jobs:
+  check-version:
+    name: Check tag ↔ package.json versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag matches package.json versions
+        run: scripts/check-release-version.sh "$GITHUB_REF_NAME"
+
+  build-game:
+    name: Build Desktop App (Godot) — ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    needs: check-version
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: Windows x64
+            preset: Windows Desktop
+            output: builds/windows/job-hunter-team.exe
+            artifact_name: app-windows-release
+            artifact_path: game/builds/windows/job-hunter-team.exe
+          - os: macos-14
+            label: macOS Universal 2
+            preset: macOS
+            output: builds/macos/job-hunter-team.zip
+            artifact_name: app-macos-release
+            artifact_path: game/builds/macos/job-hunter-team.zip
+          - os: ubuntu-22.04
+            label: Linux x64
+            preset: Linux
+            output: builds/linux/job-hunter-team.x86_64
+            artifact_name: app-linux-release
+            artifact_path: game/builds/linux/job-hunter-team-linux-x64.tar.gz
+    defaults:
+      run:
+        shell: bash
+    env:
+      JHT_NOVPS: "1"
+      HAS_MAC_SIGNING: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PWD != '' && secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: chickensoft-games/setup-godot@v2.4.1
+        with:
+          version: 4.7.0
+          use-dotnet: false
+          include-templates: true
+
+      - name: Require Apple release credentials
+        if: matrix.os == 'macos-14' && env.HAS_MAC_SIGNING != 'true'
+        run: |
+          echo "::error::macOS game releases require signing and notarization credentials."
+          echo "::error::Configure MACOS_CERTIFICATE, MACOS_CERTIFICATE_PWD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD and APPLE_TEAM_ID."
+          exit 1
+
+      - uses: apple-actions/import-codesign-certs@v7.0.0
+        if: matrix.os == 'macos-14' && env.HAS_MAC_SIGNING == 'true'
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERTIFICATE }}
+          p12-password: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+
+      - name: Import and test game
+        run: |
+          godot --headless --path game --import
+          godot --headless --path game --script res://tools/nav_grid_selftest.gd
+          godot --headless --path game --script res://tools/speech_bubble_selftest.gd
+          godot --headless --path game --script res://tools/pipeline_queue_selftest.gd
+          godot --headless --path game --script res://tools/embedded_terminal_selftest.gd
+          VPS_OUT="$(JHT_VPS_CONTRACT_TEST=1 godot --headless --path game --quit-after 3 2>&1)"
+          printf '%s\n' "$VPS_OUT" | grep "VPS-CONTRACT-TEST PASS"
+          PIPE_OUT="$(JHT_SCENE=office JHT_PIPELINE_FORCE_TEST=scout godot --headless --path game 2>&1)"
+          printf '%s\n' "$PIPE_OUT" | grep "PIPELINE-FORCE-TEST PASS"
+          DOCTOR_OUT="$(JHT_SCENE=office JHT_DOCTOR_TEST=scout-4 godot --headless --path game 2>&1)"
+          printf '%s\n' "$DOCTOR_OUT" | grep "SIMULATION-DOCTOR-TEST PASS"
+
+      - name: Export native game
+        working-directory: game
+        run: |
+          mkdir -p "$(dirname '${{ matrix.output }}')"
+          godot --headless --export-release "${{ matrix.preset }}" "${{ matrix.output }}"
+
+      - name: Sign, notarize and staple macOS game
+        if: matrix.os == 'macos-14'
+        working-directory: game
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          SIGN_DIR="$RUNNER_TEMP/jht-game-sign"
+          rm -rf "$SIGN_DIR"
+          mkdir -p "$SIGN_DIR"
+          ditto -x -k "${{ matrix.output }}" "$SIGN_DIR"
+          GAME_APP="$(find "$SIGN_DIR" -type d -name '*.app' | head -n 1)"
+          test -n "$GAME_APP"
+          IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          test -n "$IDENTITY"
+          codesign --deep --force --options runtime --timestamp --sign "$IDENTITY" "$GAME_APP"
+          codesign --verify --deep --strict --verbose=2 "$GAME_APP"
+          rm -f "${{ matrix.output }}"
+          ditto -c -k --sequesterRsrc --keepParent "$GAME_APP" "${{ matrix.output }}"
+          xcrun notarytool submit "${{ matrix.output }}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$GAME_APP"
+          xcrun stapler validate "$GAME_APP"
+          spctl --assess --type execute --verbose=2 "$GAME_APP"
+          rm -f "${{ matrix.output }}"
+          ditto -c -k --sequesterRsrc --keepParent "$GAME_APP" "${{ matrix.output }}"
+
+      - name: Smoke-test native game
+        working-directory: game
+        run: |
+          case "${{ runner.os }}" in
+            Windows)
+              JHT_NOVPS=1 "${{ matrix.output }}" --headless --quit-after 3
+              ;;
+            Linux)
+              chmod +x "${{ matrix.output }}"
+              JHT_NOVPS=1 "./${{ matrix.output }}" --headless --quit-after 3
+              ;;
+            macOS)
+              mkdir -p "$RUNNER_TEMP/jht-game"
+              ditto -x -k "${{ matrix.output }}" "$RUNNER_TEMP/jht-game"
+              GAME_BIN="$(find "$RUNNER_TEMP/jht-game" -type f -path '*/Contents/MacOS/*' | head -n 1)"
+              test -n "$GAME_BIN"
+              JHT_NOVPS=1 "$GAME_BIN" --headless --quit-after 3
+              ;;
+          esac
+
+      - name: Preserve Linux executable permissions
+        if: runner.os == 'Linux'
+        working-directory: game
+        run: |
+          tar -C builds/linux -czf builds/linux/job-hunter-team-linux-x64.tar.gz \
+            job-hunter-team.x86_64
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - check-version
+      - build-game
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag points to production HEAD
+        run: |
+          git fetch origin production --depth=1
+          TAG_SHA=$(git rev-list -n 1 "${GITHUB_REF_NAME}")
+          PROD_SHA=$(git rev-parse origin/production)
+          if [ "$TAG_SHA" != "$PROD_SHA" ]; then
+            echo "Tag ${GITHUB_REF_NAME} points to ${TAG_SHA}, but origin/production is ${PROD_SHA}."
+            echo "Tag releases only from the current production HEAD."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            web/package-lock.json
+            shared/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      # Il build web importa shared/config/schema.ts, che dipende da `zod`.
+      # Senza le deps di shared installate, turbopack non risolve `zod` da
+      # shared/node_modules e il build fallisce (Vercel lo risolve via root
+      # npm install). Allineato al job "Build Web" della CI (ci.yml).
+      - name: Install shared dependencies
+        working-directory: shared
+        run: npm ci
+
+      - name: Build web
+        working-directory: web
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+      - name: Generate release notes
+        id: changelog
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=$(awk -v version="$TAG_VERSION" '
+            $0 ~ "^## \\[" version "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md)
+
+          if [ -z "$NOTES" ]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              RANGE="${PREV_TAG}..HEAD"
+            else
+              RANGE="HEAD"
+            fi
+            NOTES=$(git log "$RANGE" --pretty=format:"- %s (%h)" --first-parent)
+          fi
+
+          if [ -z "$NOTES" ]; then
+            NOTES="- Release prepared without curated notes."
+          else
+            NOTES=$(printf "%s\n" "$NOTES" | sed '/^[[:space:]]*$/d')
+          fi
+
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Download desktop app artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: app-*-release
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Job Hunter Team ${{ github.ref_name }}"
+          body: |
+            ## What's new in ${{ github.ref_name }}
+
+            ${{ steps.changelog.outputs.notes }}
+
+            ---
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for the full history.
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/*.exe
+            release-assets/*.zip
+            release-assets/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,79 @@
+name: Security
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    # Scansione settimanale ogni lunedì alle 07:00 UTC
+    - cron: "0 7 * * 1"
+
+jobs:
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # Ciò che raggiunge gli utenti: qui una high FERMA la pipeline.
+      - name: Audit web/ — produzione
+        working-directory: web
+        run: npm audit --omit=dev --audit-level=high --package-lock-only
+
+      - name: Audit tests/js/
+        working-directory: tests/js
+        run: npm audit --audit-level=high --package-lock-only
+
+      # Le dipendenze di sviluppo restano sotto osservazione ma non bloccano il
+      # merge, perché non finiscono in nessun bundle e a volte non hanno una via
+      # d'uscita: il 25/07 l'unico avviso era brace-expansion (DoS per
+      # espansione illimitata) dentro la catena ESLint, dove minimatch@3 chiede
+      # `^1.1.7` e la correzione esiste solo nella linea 5.x — che con
+      # minimatch@3 non è nemmeno chiamabile (`expand is not a function`,
+      # verificato). L'unico fix offerto era eslint@10, che i plugin portati da
+      # eslint-config-next non accettano (peer fino a ^9): si romperebbe il lint
+      # per far tacere un avviso su un attrezzo da banco. Il log resta leggibile
+      # e Dependabot continua ad aprire le PR.
+      - name: Audit web/ — sviluppo (informativo)
+        working-directory: web
+        continue-on-error: true
+        run: npm audit --audit-level=high --package-lock-only
+
+  secrets:
+    name: Gitleaks — secrets check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: SAST — Semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Semgrep scan
+        run: |
+          semgrep scan \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/secrets \
+            --exclude "tests/**" \
+            --exclude "node_modules/**"

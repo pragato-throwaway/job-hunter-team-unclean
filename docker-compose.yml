@@ -1,0 +1,113 @@
+# Job Hunter Team — Runtime container (production / utenti finali)
+#
+# Questo compose e' il default per chi installa JHT via:
+#   curl -fsSL https://jobhunterteam.ai/install.sh | bash
+#
+# install.sh scarica questo file in ~/.jht/runtime/docker-compose.yml.
+# Il wrapper bash ~/.local/bin/jht lo usa per docker compose up/down/exec.
+#
+# Image-only: nessun bind dei sorgenti, nessun `build:`. Tutto cio' che
+# serve sta dentro l'immagine GHCR. Per il dev mode con hot-reload usa
+# docker-compose.dev.yml (override) — vedi commento in fondo al file.
+#
+# Stato persistente: bind-mount di ~/.jht (config nascosta) e
+# ~/Documents/Job Hunter Team (CV e output visibili).
+
+services:
+  jht:
+    # Override via env var: JHT_IMAGE=ghcr.io/leopu00/jht:dev-1 jht upgrade
+    # Utile per testare immagini di branch dev prima del merge a master.
+    image: ${JHT_IMAGE:-ghcr.io/leopu00/jht:latest}
+    container_name: jht
+    # Override del CMD Dockerfile (--help): entry point `pid1` che
+    # in base a JHT_HOST_TYPE dispatch tra:
+    #   - vps  + cloud paired → `cloud daemon` (push loop verso prod)
+    #   - vps  no cloud       → bridges + watchdog (daemon parte al pairing)
+    #   - local               → bridges + watchdog
+    # Niente dashboard web locale (ritirata 2026-07-23): l'interazione
+    # local/VPS passa dall'app desktop via docker exec / SSH; il browser
+    # serve solo il cloud (jobhunterteam.ai, con login).
+    # Vedi cli/src/commands/pid1.js per dettagli.
+    command: ["pid1"]
+    environment:
+      # HOME points at the bind-mounted /jht_home so CLI credential
+      # files (~/.claude, ~/.codex, ~/.kimi) land on the host disk
+      # and persist across container recreation.
+      - HOME=/jht_home
+      - JHT_HOME=/jht_home
+      - JHT_USER_DIR=/jht_user
+      # JHT_HOST_TYPE letto da pid1 dispatcher. Default `local` per
+      # backwards-compat: solo VPS via host-setup.sh setta esplicitamente
+      # `vps` in ~/.jht/host.env (montato come /jht_home/host.env).
+      - JHT_HOST_TYPE=${JHT_HOST_TYPE:-}
+      # JHT_LANG (en|it) — scelto dall'utente al primo run del wizard.
+      # I componenti che hanno bisogno della lingua (wizard, futuri
+      # messaggi degli agenti, dashboard intelligence) leggono questa.
+      - JHT_LANG=${JHT_LANG:-en}
+      # Bug #15: timezone utente (IANA, es. Europe/Rome, Asia/Shanghai).
+      # Chiesta nel setup wizard (host-setup.sh), salvata in
+      # ~/.jht/host.env. Default UTC: niente assunzione geografica
+      # (utenti in CN/US/EU/AU). Letta da format_time skill per
+      # convertire timestamp nei messaggi Telegram/grafici user-facing.
+      - JHT_USER_TZ=${JHT_USER_TZ:-UTC}
+      # IS_CONTAINER=1 abilita il passthrough in cli/src/utils/container-proxy.js:
+      # le funzioni che oggi farebbero `docker exec jht ...` eseguono
+      # comandi locali (siamo gia' nel posto giusto). Vedi
+      # docs/internal/vps.md.
+      - IS_CONTAINER=1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      # NB: nonostante il prefisso NEXT_PUBLIC_, queste due NON servono a
+      # Next (che qui non gira): le legge il sync del container —
+      # shared/skills/db_to_supabase.py e `jht doctor` — come fallback
+      # quando la config non arriva da ~/.jht/cloud.json. Non rimuoverle.
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL:-}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      # [JHT-DASHBOARD-SPLIT] Deploy-mode DURO deciso a build/deploy. Il
+      # container (PC locale o VPS via tunnel SSH) è sempre CO-LOCATO col team
+      # → 'local': SQLite source-of-truth, scrittura piena. Solo il deploy
+      # Vercel imposta 'cloud' (sola lettura + corsia richieste). Default
+      # 'local' anche se l'env manca (vedi web/lib/deploy-mode.ts).
+      - NEXT_PUBLIC_JHT_DEPLOY=${NEXT_PUBLIC_JHT_DEPLOY:-local}
+      # ── CLI dei provider FUORI dal bind-mount ────────────────────────
+      # Su Windows /jht_home e' C:\ visto attraverso WSL2: scrivere li'
+      # dentro costa ~158x piu' che sul disco del container (misurato su
+      # T440s: 200 file piccoli = 11.209 ms contro 71 ms). npm e uv creano
+      # decine di migliaia di file minuscoli, ed e' esattamente il caso
+      # peggiore: installare un CLI passava da mezzo minuto (Linux) a
+      # un'attesa interminabile (Windows). Su Linux e macOS il mount e'
+      # locale e non cambia nulla.
+      # /opt/jht-deps e' gia' il prefisso scrivibile degli agenti ed e'
+      # ora un volume: i CLI installati sopravvivono alla ricreazione del
+      # container come facevano nel bind-mount.
+      - NPM_CONFIG_PREFIX=/opt/jht-deps/npm-global
+      - NPM_CONFIG_CACHE=/opt/jht-deps/npm-cache
+      - UV_TOOL_DIR=/opt/jht-deps/uv-tools
+      - UV_TOOL_BIN_DIR=/opt/jht-deps/bin
+      - UV_CACHE_DIR=/opt/jht-deps/uv-cache
+      # PATH esplicito: il nuovo prefisso davanti, il vecchio dietro come
+      # rete per chi ha gia' i CLI installati nel bind-mount.
+      - PATH=/app/agents/_tools:/opt/jht-deps/bin:/opt/jht-deps/npm-global/bin:/opt/jht-deps/python/bin:/jht_home/.npm-global/bin:/jht_home/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games
+    volumes:
+      - ${HOME}/.jht:/jht_home
+      - ${HOME}/Documents/Job Hunter Team:/jht_user
+      # Volume Docker (dentro la VM su Windows/macOS: veloce), non bind.
+      - jht-deps:/opt/jht-deps
+    # Nessuna porta esposta: la dashboard web locale e' stata ritirata
+    # (2026-07-23) — l'interazione passa dall'app desktop (docker exec).
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  jht-deps:
+
+# ── Dev mode ────────────────────────────────────────────────────────────
+#
+# Per sviluppare con hot-reload dei sorgenti (web/, agents/, shared/,
+# .launcher/) usa l'override docker-compose.dev.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Build l'immagine localmente dal Dockerfile invece di pullare da GHCR.

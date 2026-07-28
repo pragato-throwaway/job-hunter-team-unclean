@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  lint-typecheck:
+    name: Lint & Type-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            web/package-lock.json
+            shared/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Install shared dependencies
+        working-directory: shared
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+  # Le suite (vitest, pytest, e2e) stanno in test.yml, non qui: fino al
+  # 2026-07-26 questo file conteneva un job `Vitest` identico a quello di
+  # test.yml, stesso trigger e stesso codice testato due volte. Qui resta ciò
+  # che test.yml non fa: lint, type-check e build del web.
+  build:
+    name: Build Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: |
+            web/package-lock.json
+            shared/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Install shared dependencies
+        working-directory: shared
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
